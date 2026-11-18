@@ -1,68 +1,104 @@
+import logging
 
-# Import necessary libraries
-import numpy as np
-import joblib  # For loading the serialized model
-import pandas as pd  # For data manipulation
-from flask import Flask, request, jsonify  # For creating the Flask API
+import joblib
+import pandas as pd
+from flask import Flask, request, jsonify
 
-# Initialize Flask app with a name
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("superkart")
+
 superkart_api = Flask("SuperKart")
 
-# Load the trained model
+# Load the serialized pipeline (encoder + tuned Random Forest) once at start-up
 model = joblib.load("superkart_model.joblib")
+log.info("Model loaded")
 
-# Define a route for the home page
-@superkart_api.get('/')
+NUMERIC = {  # field: (min, max)
+    "Product_Weight": (0.01, None),
+    "Product_Allocated_Area": (0.0, 1.0),
+    "Product_MRP": (0.01, None),
+    "Store_Age_Years": (0, 100),
+}
+CATEGORICAL = {
+    "Product_Sugar_Content": {"Low Sugar", "Regular", "No Sugar"},
+    "Store_Size": {"Small", "Medium", "High"},
+    "Store_Location_City_Type": {"Tier 1", "Tier 2", "Tier 3"},
+    "Store_Type": {"Supermarket Type1", "Supermarket Type2", "Departmental Store", "Food Mart"},
+    "Product_Id_char": {"FD", "DR", "NC"},
+    "Product_Type_Category": {"Perishables", "Non Perishables"},
+}
+FIELDS = list(NUMERIC) + list(CATEGORICAL)
+
+
+class BadRequest(Exception):
+    pass
+
+
+def validate_frame(df):
+    """Raise BadRequest with a clear message if the data is unusable."""
+    missing = [c for c in FIELDS if c not in df.columns]
+    if missing:
+        raise BadRequest(f"Missing required field(s): {', '.join(missing)}")
+    df = df[FIELDS].copy()
+    for col, (lo, hi) in NUMERIC.items():
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if df[col].isna().any():
+            raise BadRequest(f"{col} must be a number in every row")
+        if (df[col] < lo).any() or (hi is not None and (df[col] > hi).any()):
+            raise BadRequest(f"{col} is out of range (min {lo}" + (f", max {hi})" if hi is not None else ")"))
+    for col, allowed in CATEGORICAL.items():
+        bad = set(df[col].astype(str)) - allowed
+        if bad:
+            raise BadRequest(f"{col} has invalid value(s) {sorted(bad)}; allowed: {sorted(allowed)}")
+    return df
+
+
+@superkart_api.get("/")
 def home():
     return "Welcome to the SuperKart System"
 
-# Define an endpoint to predict sales for a single product
-@superkart_api.post('/v1/predict')
+
+@superkart_api.post("/v1/predict")
 def predict_sales():
-    # Get JSON data from the request
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise BadRequest("Request body must be a JSON object")
+    df = validate_frame(pd.DataFrame([data]))
+    prediction = float(model.predict(df)[0])
+    log.info("Single prediction served")
+    return jsonify({"Sales": prediction})
 
-    # Extract relevant features from the input data
-    sample = {
-    'Product_Weight': data['Product_Weight'],
-    'Product_Sugar_Content': data['Product_Sugar_Content'],
-    'Product_Allocated_Area': data['Product_Allocated_Area'],
-    'Product_MRP': data['Product_MRP'],
-    'Store_Size': data['Store_Size'],
-    'Store_Location_City_Type': data['Store_Location_City_Type'],
-    'Store_Type': data['Store_Type'],
-    'Product_Id_char': data['Product_Id_char'],
-    'Store_Age_Years': data['Store_Age_Years'],
-    'Product_Type_Category': data['Product_Type_Category']
-}
 
-    # Convert the extracted data into a DataFrame
-    input_data = pd.DataFrame([sample])
-
-    # Make a prediction using the trained model
-    prediction = model.predict(input_data).tolist()[0]
-
-    # Return the prediction as a JSON response
-    return jsonify({'Sales': prediction})
-
-# Define an endpoint to predict sales for a batch of products
-@superkart_api.post('/v1/predictbatch')
+@superkart_api.post("/v1/predictbatch")
 def predict_sales_batch():
-    # Get the uploaded CSV file from the request
-    file = request.files['file']
+    file = request.files.get("file")
+    if file is None or not file.filename:
+        raise BadRequest("Upload a CSV file in the 'file' form field")
+    if not file.filename.lower().endswith(".csv"):
+        raise BadRequest("Only .csv files are accepted")
+    try:
+        df = pd.read_csv(file)
+    except Exception:
+        raise BadRequest("The file could not be read as CSV")
+    if df.empty:
+        raise BadRequest("The CSV file has no rows")
+    df = validate_frame(df)
+    predictions = [float(p) for p in model.predict(df)]
+    log.info("Batch prediction served for %d rows", len(predictions))
+    return {str(i): round(p, 2) for i, p in enumerate(predictions)}
 
-    # Read the file into a DataFrame
-    input_data = pd.read_csv(file)
 
-    # Make predictions for the batch data
-    predictions = model.predict(input_data).tolist()
-
-    # Create an output dictionary mapping row index to predicted sales
-    output_dict = {str(i): round(pred, 2) for i, pred in enumerate(predictions)}
-
-    return output_dict
+@superkart_api.errorhandler(BadRequest)
+def handle_bad_request(err):
+    log.warning("400: %s", err)
+    return jsonify({"error": str(err)}), 400
 
 
-# Run the Flask app in debug mode
-if __name__ == '__main__':
-    superkart_api.run(debug=True)
+@superkart_api.errorhandler(Exception)
+def handle_unexpected(err):
+    log.exception("Unexpected error")
+    return jsonify({"error": "Internal server error"}), 500
+
+
+if __name__ == "__main__":
+    superkart_api.run(debug=False)
